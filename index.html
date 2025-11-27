@@ -1,0 +1,342 @@
+import React, { useState, useCallback } from 'react';
+
+// --- Hilfsfunktionen ---
+
+/**
+ * Konvertiert eine Bilddatei in einen reinen Base64-String (ohne Daten-Präfix)
+ * für die Gemini API.
+ * @param {File} file - Die Bilddatei, die hochgeladen wurde.
+ * @returns {Promise<{base64Data: string, mimeType: string}>} - Ein Objekt mit den Base64-Daten und dem MIME-Typ.
+ */
+const convertFileToBase64 = (file) => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = () => {
+      const dataUrl = reader.result;
+      const base64Data = dataUrl.split(',')[1];
+      resolve({ base64Data, mimeType: file.type });
+    };
+    reader.onerror = (error) => {
+      reject(error);
+    };
+  });
+};
+
+/**
+ * Führt einen API-Aufruf mit exponentiellem Backoff durch.
+ * @param {Function} apiCallFunction - Die Funktion, die den fetch-Aufruf durchführt.
+ * @param {number} maxRetries - Maximale Anzahl von Wiederholungsversuchen.
+ * @returns {Promise<any>} - Das Ergebnis des erfolgreichen API-Aufrufs.
+ */
+const fetchWithBackoff = async (apiCallFunction, maxRetries = 5) => {
+  let attempt = 0;
+  while (attempt < maxRetries) {
+    try {
+      const response = await apiCallFunction();
+      if (response.ok) {
+        return response.json();
+      } else {
+        // Bei 429 (Too Many Requests) oder 5xx-Fehlern erneut versuchen
+        if (response.status === 429 || response.status >= 500) {
+          throw new Error(`API Error: ${response.status}`);
+        } else {
+          // Bei anderen Client-Fehlern (z.B. 400 Bad Request) sofort abbrechen
+          return response.json(); // Zur Fehlerbehandlung im Haupt-Try-Block
+        }
+      }
+    } catch (error) {
+      if (attempt === maxRetries - 1) {
+        throw error; // Letzter Versuch fehlgeschlagen
+      }
+      const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
+      // Kein Logging für Backoff-Versuche
+      await new Promise(resolve => setTimeout(resolve, delay));
+      attempt++;
+    }
+  }
+};
+
+
+// --- Haupt-App-Komponente ---
+
+export default function App() {
+  const [thesisText, setThesisText] = useState("");
+  const [chartImage, setChartImage] = useState(null);
+  const [chartPreview, setChartPreview] = useState(null);
+  
+  const [devilResponse, setDevilResponse] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+
+  /**
+   * Verarbeitet die hochgeladene oder gezogene Bilddatei.
+   * @param {File} file - Die Bilddatei.
+   */
+  const processImageFile = (file) => {
+    if (file && file.type.startsWith('image/')) {
+      setChartImage(file);
+      setError(null);
+      
+      // Erzeuge eine Vorschau
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onloadend = () => {
+        setChartPreview(reader.result);
+      };
+    } else {
+      setError("Bitte laden Sie eine gültige Bilddatei hoch.");
+      setChartImage(null);
+      setChartPreview(null);
+    }
+  };
+
+  /**
+   * Behandelt die Dateiauswahl über den "Durchsuchen"-Button.
+   * @param {React.ChangeEvent<HTMLInputElement>} e - Das Event-Objekt.
+   */
+  const handleFileChange = (e) => {
+    if (e.target.files && e.target.files[0]) {
+      processImageFile(e.target.files[0]);
+    }
+    e.target.value = null; // Ermöglicht das erneute Hochladen derselben Datei
+  };
+
+  /**
+   * Behandelt das Ziehen einer Datei über den Drop-Bereich.
+   * @param {React.DragEvent<HTMLDivElement>} e - Das Drag-Event.
+   */
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(true);
+  };
+
+  /**
+   * Behandelt das Verlassen des Drop-Bereichs.
+   * @param {React.DragEvent<HTMLDivElement>} e - Das Drag-Event.
+   */
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+  };
+
+  /**
+   * Behandelt das Fallenlassen einer Datei im Drop-Bereich.
+   * @param {React.DragEvent<HTMLDivElement>} e - Das Drag-Event.
+   */
+  const handleDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+    
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      processImageFile(e.dataTransfer.files[0]);
+    }
+  };
+
+  /**
+   * Ruft die Gemini API auf, um die These zu widerlegen.
+   */
+  const callDevilAPI = async (base64ImageData, mimeType, userText) => {
+    const apiKey = ""; // Wird automatisch von der Umgebung bereitgestellt
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+    const systemPrompt = `
+Du bist 'Des Teufels Advokat', ein extrem skeptischer, zynischer und erfahrener Finanzanalyst und Risikomanager.
+Deine einzige Aufgabe ist es, die These eines Traders zu zerlegen, jede Schwachstelle zu finden und das stärkste mögliche Gegenargument zu präsentieren.
+Der Nutzer liefert eine These (Text) und einen Chart (Bild). Analysiere beides.
+STIMME DEM NUTZER NIEMALS ZU. Deine Aufgabe ist es, seine These zu widerlegen.
+Zeige ungesehene Risiken auf, bärische Muster im Chart, die er ignoriert, Bestätigungsfehler (Confirmation Bias), emotionale Argumente (FOMO, Hoffnung, Gier) und logische Fehlschlüsse.
+Was ist der stärkste bärische Fall? Was übersieht der Trader komplett?
+Sei direkt, professionell, unnachgiebig und kritisch. Beginne deine Antwort IMMER mit: 'Hier ist, was Sie übersehen...' oder einer ähnlich direkten Widerlegung.
+Präsentiere deine Gegenargumente klar und prägnant in Stichpunkten.
+`.trim();
+
+    const payload = {
+      systemInstruction: {
+        parts: [{ text: systemPrompt }]
+      },
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: `Hier ist meine These: "${userText}"` },
+            {
+              inlineData: {
+                mimeType: mimeType,
+                data: base64ImageData
+              }
+            }
+          ]
+        }
+      ]
+    };
+
+    const apiCallFunction = () => fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    const result = await fetchWithBackoff(apiCallFunction);
+
+    if (result.candidates && result.candidates[0].content?.parts?.[0]?.text) {
+      return result.candidates[0].content.parts[0].text;
+    } else {
+      console.error("Unerwartete API-Antwortstruktur:", result);
+      throw new Error(result.error?.message || "Die KI konnte keine Antwort generieren.");
+    }
+  };
+
+  /**
+   * Behandelt das Absenden des Formulars.
+   * @param {React.MouseEvent<HTMLButtonElement>} e - Das Klick-Event.
+   */
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!chartImage || !thesisText.trim()) {
+      setError("Bitte laden Sie einen Chart hoch UND beschreiben Sie Ihre These.");
+      return;
+    }
+
+    setIsLoading(true);
+    setError(null);
+    setDevilResponse("");
+
+    try {
+      // 1. Bild konvertieren
+      const { base64Data, mimeType } = await convertFileToBase64(chartImage);
+      
+      // 2. API aufrufen
+      const responseText = await callDevilAPI(base64Data, mimeType, thesisText);
+      
+      setDevilResponse(responseText);
+      
+    } catch (err) {
+      console.error(err);
+      setError(`Ein Fehler ist aufgetreten: ${err.message}. Bitte versuchen Sie es später erneut.`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="flex justify-center items-start min-h-screen bg-slate-100 p-4 sm:p-8 font-sans">
+      <div className="w-full max-w-2xl bg-white shadow-2xl rounded-xl overflow-hidden">
+        
+        {/* Header */}
+        <header className="flex justify-between items-center p-5 bg-slate-800 text-white">
+          <h1 className="text-xl sm:text-2xl font-bold">Devil's Advocate Analyzer</h1>
+          <span className="text-3xl" role="img" aria-label="Warning">⚠️</span>
+        </header>
+
+        {/* Formular-Container */}
+        <div className="p-5 sm:p-8 space-y-8">
+          
+          {/* 1. Chart Hochladen */}
+          <section className="space-y-4">
+            <h2 className="text-lg sm:text-xl font-semibold text-slate-700">1. Chart Hochladen (Visuelle Daten)</h2>
+            <div
+              onDrop={handleDrop}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              className={`relative flex flex-col justify-center items-center w-full min-h-60 p-6 border-2 ${isDragOver ? 'border-blue-500 bg-blue-50' : 'border-gray-300 border-dashed'} rounded-lg transition-colors duration-200`}
+            >
+              {chartPreview ? (
+                <>
+                  <img src={chartPreview} alt="Chart Vorschau" className="max-h-80 w-auto object-contain rounded-md shadow-sm" />
+                  <button
+                    onClick={() => {
+                      setChartImage(null);
+                      setChartPreview(null);
+                    }}
+                    className="absolute top-2 right-2 bg-black bg-opacity-50 text-white rounded-full h-8 w-8 flex items-center justify-center font-bold text-lg hover:bg-opacity-75 transition-all"
+                    aria-label="Bild entfernen"
+                  >
+                    &times;
+                  </button>
+                </>
+              ) : (
+                <div className="text-center space-y-4">
+                  <span className="text-6xl text-gray-300">🖼️</span>
+                  <p className="text-gray-500">Ziehen Sie Ihren Chart hierher</p>
+                  <p className="text-gray-400 text-sm">- oder -</p>
+                  <label
+                    htmlFor="file-upload"
+                    className="cursor-pointer inline-block px-6 py-2 bg-blue-500 text-white font-medium rounded-lg shadow-md hover:bg-blue-600 transition-colors"
+                  >
+                    Datei Durchsuchen
+                  </label>
+                  <input
+                    id="file-upload"
+                    type="file"
+                    className="hidden"
+                    accept="image/*"
+                    onChange={handleFileChange}
+                  />
+                </div>
+              )}
+            </div>
+          </section>
+
+          {/* 2. These & Begründung */}
+          <section className="space-y-4">
+            <h2 className="text-lg sm:text-xl font-semibold text-slate-700">2. Ihre These & Begründung</h2>
+            <textarea
+              value={thesisText}
+              onChange={(e) => setThesisText(e.target.value)}
+              rows="6"
+              className="w-full p-4 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-shadow"
+              placeholder="z.B. Asset, Richtung (Long/Short), Einstiegspunkt, Stop-Loss, Kursziel, Begründung (z.B. 'Ausbruch aus Konsolidierung'), aktuelle Emotionen (z.B. 'FOMO', 'zuversichtlich')..."
+            />
+          </section>
+
+          {/* 3. Action Button */}
+          <section>
+            <button
+              onClick={handleSubmit}
+              disabled={isLoading || !chartImage || !thesisText.trim()}
+              className="w-full flex justify-center items-center gap-3 px-6 py-4 bg-red-600 text-white text-lg font-bold rounded-lg shadow-lg hover:bg-red-700 transition-all duration-200 focus:outline-none focus:ring-4 focus:ring-red-300
+                         disabled:bg-gray-400 disabled:cursor-not-allowed disabled:shadow-none"
+            >
+              {isLoading ? (
+                <>
+                  <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                  Analysiere...
+                </>
+              ) : (
+                "These Widerlegen"
+              )}
+            </button>
+            {error && <p className="text-red-600 text-sm text-center mt-3">{error}</p>}
+          </section>
+
+          {/* 4. Output / Antwort */}
+          {devilResponse && (
+            <section className="space-y-4 pt-4 border-t border-gray-200">
+              <h2 className="text-xl font-semibold text-slate-800">Des Teufels Advokat sagt:</h2>
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-5">
+                {/* whitespace-pre-wrap behält Zeilenumbrüche und Umbrüche aus der API-Antwort bei */}
+                <p className="text-slate-700 leading-relaxed whitespace-pre-wrap">{devilResponse}</p>
+              </div>
+            </section>
+          )}
+
+        </div>
+
+        {/* Footer */}
+        <footer className="p-4 bg-gray-50 border-t border-gray-100">
+          <p className="text-center text-xs text-gray-500 font-medium">
+            Proaktives Risikomanagement Tool
+          </p>
+        </footer>
+      </div>
+    </div>
+  );
+}
